@@ -75,6 +75,10 @@ test = true
 name = "water"
 test = true
 
+[[example]]
+name = "kagong"
+test = true
+
 [features]
 default = []
 spirv = ["naga/spv-in"]
