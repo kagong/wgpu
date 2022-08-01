@@ -17,6 +17,10 @@ struct Data {
 @binding(0)
 var<uniform> r_data: Data;
 
+@group(0)
+@binding(3)
+var<uniform> local_matrix: mat4x4<f32>;
+
 @vertex
 fn vs_sky(@builtin(vertex_index) vertex_index: u32) -> SkyOutput {
     // hacky way to draw a large triangle
@@ -53,7 +57,7 @@ fn vs_entity(
     var result: EntityOutput;
     result.normal = normal;
     result.view = pos - r_data.cam_pos.xyz;
-    result.position = r_data.proj * r_data.view * vec4<f32>(pos, 1.0);
+    result.position = r_data.proj * r_data.view * local_matrix * vec4<f32>(pos, 1.0);
     return result;
 }
 

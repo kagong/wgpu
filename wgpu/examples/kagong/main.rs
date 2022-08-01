@@ -30,7 +30,7 @@ struct Camera {
 impl Camera {
     fn to_uniform_data(&self) -> [f32; 16 * 3 + 4] {
         let aspect = self.screen_size.0 as f32 / self.screen_size.1 as f32;
-        let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect, 1.0, 50.0);
+        let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect, 1.0, 5000.0);
         
         let view = glam::Mat4::look_at_rh(
             self.pos,
@@ -55,11 +55,13 @@ pub struct Skybox {
     entity_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
+    uniform_local_matrix_buf: wgpu::Buffer,
     entities: Vec<Entity>,
     depth_view: wgpu::TextureView,
     staging_belt: wgpu::util::StagingBelt,
     left_click : bool,
     dxdy : (f32, f32),
+    local_matrix : glam::Mat4,
 }
 
 impl Skybox {
@@ -85,25 +87,17 @@ impl Skybox {
 
         depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
-}
 
-impl framework::Example for Skybox {
-    fn optional_features() -> wgpu::Features {
-        wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR
-            | wgpu::Features::TEXTURE_COMPRESSION_ETC2
-            | wgpu::Features::TEXTURE_COMPRESSION_BC
-    }
-
-    fn init(
-        config: &wgpu::SurfaceConfiguration,
-        _adapter: &wgpu::Adapter,
+    fn get_entities(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Self {
+    ) ->Vec<Entity>{
         let mut entities = Vec::new();
-        {
-            let source = include_bytes!("asset/teslacyberv3.0.obj");
-            let data = obj::ObjData::load_buf(&source[..]).unwrap();
+        let mut obj_load = obj::Obj::load("C:/MIDAS/wgpu/wgpu/examples/kagong/asset/Skull/12140_Skull_v3_L2.obj").unwrap();
+        
+            let _ = obj_load.load_mtls();
+            
+            let data = obj_load.data;
+            
             let mut vertices = Vec::new();
             for object in data.objects {
                 for group in object.groups {
@@ -131,7 +125,25 @@ impl framework::Example for Skybox {
                     });
                 }
             }
-        }
+        entities
+    }
+}
+
+impl framework::Example for Skybox {
+    fn optional_features() -> wgpu::Features {
+        wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR
+            | wgpu::Features::TEXTURE_COMPRESSION_ETC2
+            | wgpu::Features::TEXTURE_COMPRESSION_BC
+    }
+    
+    fn init(
+        config: &wgpu::SurfaceConfiguration,
+        _adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Self {
+
+        let entities = Self::get_entities(device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -162,6 +174,16 @@ impl framework::Example for Skybox {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -177,10 +199,18 @@ impl framework::Example for Skybox {
             dir : glam::vec3(0.0, 0.0, -1.0)
         };
 
-        let raw_uniforms = camera.to_uniform_data();
+        let cam_uniforms = camera.to_uniform_data();
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Buffer"),
-            contents: bytemuck::cast_slice(&raw_uniforms),
+            contents: bytemuck::cast_slice(&cam_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let local_matrix = glam::Mat4::default();
+        let init_local_matrix = local_matrix.to_cols_array();
+        let uniform_local_matrix_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local matrix Buffer"),
+            contents: bytemuck::cast_slice(&init_local_matrix),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -348,6 +378,10 @@ impl framework::Example for Skybox {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_local_matrix_buf.as_entire_binding(),
+                },
             ],
             label: None,
         });
@@ -357,17 +391,20 @@ impl framework::Example for Skybox {
         let left_click = false;
 
         let dxdy = (0.0, 0.0);
+
         Skybox {
             camera,
             sky_pipeline,
             entity_pipeline,
             bind_group,
             uniform_buf,
+            uniform_local_matrix_buf,
             entities,
             depth_view,
             staging_belt: wgpu::util::StagingBelt::new(0x100),
             left_click,
             dxdy,
+            local_matrix,
         }
     }
 
@@ -415,6 +452,16 @@ impl framework::Example for Skybox {
                         Some(winit::event::VirtualKeyCode::A) => { 
                             self.camera.pos -= glam::Vec3::X * 0.1;
                         },
+                        Some(winit::event::VirtualKeyCode::Z) => { 
+                            self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
+                        },
+                        Some(winit::event::VirtualKeyCode::X) => { 
+                            self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
+                        },
+                        Some(winit::event::VirtualKeyCode::C) => { 
+                            self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
+                        },
+
                         _ => {
                         },
                     }
@@ -424,7 +471,7 @@ impl framework::Example for Skybox {
 
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 if let winit::event::MouseScrollDelta::LineDelta(_, y ) = delta { 
-                    self.camera.pos += self.camera.dir * (y) * 0.1;
+                    self.camera.pos += self.camera.dir * (y) * 1.0;
                 }
                 
             }
@@ -463,6 +510,17 @@ impl framework::Example for Skybox {
                 device,
             )
             .copy_from_slice(bytemuck::cast_slice(&raw_uniforms));
+
+        let raw_local = self.local_matrix.to_cols_array();
+        self.staging_belt
+            .write_buffer(
+                &mut encoder,
+                &self.uniform_local_matrix_buf,
+                0,
+                wgpu::BufferSize::new((raw_local.len() * 4) as wgpu::BufferAddress).unwrap(),
+                device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&raw_local));
 
         self.staging_belt.finish();
 
