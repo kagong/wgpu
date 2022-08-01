@@ -12,6 +12,7 @@ const IMAGE_SIZE: u32 = 128;
 struct Vertex {
     pos: [f32; 3],
     normal: [f32; 3],
+    texture: [f32; 2],
 }
 
 struct Entity {
@@ -105,11 +106,13 @@ impl Skybox {
                     for poly in group.polys {
                         for end_index in 2..poly.0.len() {
                             for &index in &[0, end_index - 1, end_index] {
-                                let obj::IndexTuple(position_id, _texture_id, normal_id) =
+                                let obj::IndexTuple(position_id, texture_id, normal_id) =
                                     poly.0[index];
                                 vertices.push(Vertex {
                                     pos: data.position[position_id],
                                     normal: data.normal[normal_id.unwrap()],
+                                    texture: data.texture[texture_id.unwrap()],
+                                    
                                 })
                             }
                         }
@@ -184,6 +187,16 @@ impl framework::Example for Skybox {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -196,7 +209,7 @@ impl framework::Example for Skybox {
         let camera = Camera {
             screen_size: (config.width, config.height),
             pos : glam::vec3(0.0, 0.0, 0.0),
-            dir : glam::vec3(0.0, 0.0, -1.0)
+            dir : glam::vec3(0.0, 0.0, 1.0)
         };
 
         let cam_uniforms = camera.to_uniform_data();
@@ -257,7 +270,7 @@ impl framework::Example for Skybox {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                 }],
             },
             fragment: Some(wgpu::FragmentState {
@@ -291,78 +304,120 @@ impl framework::Example for Skybox {
             ..Default::default()
         });
 
-        let device_features = device.features();
+        
+        let skybox_texture_view = {
+            let device_features = device.features();
 
-        let skybox_format =
-            if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
-                log::info!("Using ASTC_LDR");
+            let skybox_format =
+                if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
+                    log::info!("Using ASTC_LDR");
+                    wgpu::TextureFormat::Astc {
+                        block: AstcBlock::B4x4,
+                        channel: AstcChannel::UnormSrgb,
+                    }
+                } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+                    log::info!("Using ETC2");
+                    wgpu::TextureFormat::Etc2Rgb8UnormSrgb
+                } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+                    log::info!("Using BC");
+                    wgpu::TextureFormat::Bc1RgbaUnormSrgb
+                } else {
+                    log::info!("Using plain");
+                    wgpu::TextureFormat::Bgra8UnormSrgb
+                };
+
+            let size = wgpu::Extent3d {
+                width: IMAGE_SIZE,
+                height: IMAGE_SIZE,
+                depth_or_array_layers: 6,
+            };
+
+            let layer_size = wgpu::Extent3d {
+                depth_or_array_layers: 1,
+                ..size
+            };
+            let max_mips = layer_size.max_mips(wgpu::TextureDimension::D2);
+
+            log::debug!(
+                "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
+                skybox_format,
+                IMAGE_SIZE,
+                IMAGE_SIZE,
+                max_mips,
+            );
+
+            let bytes = match skybox_format {
                 wgpu::TextureFormat::Astc {
                     block: AstcBlock::B4x4,
                     channel: AstcChannel::UnormSrgb,
-                }
-            } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
-                log::info!("Using ETC2");
-                wgpu::TextureFormat::Etc2Rgb8UnormSrgb
-            } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
-                log::info!("Using BC");
-                wgpu::TextureFormat::Bc1RgbaUnormSrgb
-            } else {
-                log::info!("Using plain");
-                wgpu::TextureFormat::Bgra8UnormSrgb
+                } => &include_bytes!("images/astc.dds")[..],
+                wgpu::TextureFormat::Etc2Rgb8UnormSrgb => &include_bytes!("images/etc2.dds")[..],
+                wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
+                wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
+                _ => unreachable!(),
             };
 
-        let size = wgpu::Extent3d {
-            width: IMAGE_SIZE,
-            height: IMAGE_SIZE,
-            depth_or_array_layers: 6,
+            let image = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+            let texture = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    size,
+                    mip_level_count: max_mips as u32,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: skybox_format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    label: None,
+                },
+                &image.data,
+            );
+
+            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: None,
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                ..wgpu::TextureViewDescriptor::default()
+            });
+            texture_view
         };
 
-        let layer_size = wgpu::Extent3d {
-            depth_or_array_layers: 1,
-            ..size
-        };
-        let max_mips = layer_size.max_mips(wgpu::TextureDimension::D2);
+        let matl_texture_view = {
+            let img_data = include_bytes!("asset/Skull/Skull.png");
+            let decoder = png::Decoder::new(std::io::Cursor::new(img_data));
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
 
-        log::debug!(
-            "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
-            skybox_format,
-            IMAGE_SIZE,
-            IMAGE_SIZE,
-            max_mips,
-        );
+            let size = wgpu::Extent3d {
+                width: info.width,
+                height: info.height,
+                depth_or_array_layers: 1,
+            };
 
-        let bytes = match skybox_format {
-            wgpu::TextureFormat::Astc {
-                block: AstcBlock::B4x4,
-                channel: AstcChannel::UnormSrgb,
-            } => &include_bytes!("images/astc.dds")[..],
-            wgpu::TextureFormat::Etc2Rgb8UnormSrgb => &include_bytes!("images/etc2.dds")[..],
-            wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
-            wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
-            _ => unreachable!(),
-        };
-
-        let image = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).unwrap();
-
-        let texture = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
                 size,
-                mip_level_count: max_mips as u32,
+                mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: skybox_format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                label: None,
-            },
-            &image.data,
-        );
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            });
 
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: None,
-            dimension: Some(wgpu::TextureViewDimension::Cube),
-            ..wgpu::TextureViewDescriptor::default()
-        });
+            queue.write_texture(
+                texture.as_image_copy(),
+                &buf,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: std::num::NonZeroU32::new(info.width * 4),
+                    rows_per_image: None,
+                },
+                size,
+            );
+
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
             entries: &[
@@ -372,7 +427,7 @@ impl framework::Example for Skybox {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                    resource: wgpu::BindingResource::TextureView(&skybox_texture_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -381,6 +436,10 @@ impl framework::Example for Skybox {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: uniform_local_matrix_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&matl_texture_view),
                 },
             ],
             label: None,
