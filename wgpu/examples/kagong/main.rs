@@ -6,6 +6,7 @@ use std::{borrow::Cow, f32::consts};
 use wgpu::{util::DeviceExt, AstcBlock, AstcChannel};
 
 const IMAGE_SIZE: u32 = 128;
+const INSTANCE_SIZE: usize = 4;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -89,6 +90,22 @@ impl Skybox {
         depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
+    fn get_instance() -> [f32;16*INSTANCE_SIZE*INSTANCE_SIZE]{
+        let mut instance_matrix = [0f32; 16*INSTANCE_SIZE * INSTANCE_SIZE ];
+
+        for i in 0..INSTANCE_SIZE{
+            for j in 0..INSTANCE_SIZE{
+                let start_index = i*INSTANCE_SIZE*16 + j*16;
+                let stride: f32 = 5.0;
+                let mat = glam::Mat4::from_translation(glam::vec3(stride*(i as f32),stride*(j as f32),0.0));
+                
+                instance_matrix[start_index..start_index+16].copy_from_slice(&AsRef::<[f32; 16]>::as_ref(&mat)[..]);
+            }
+        }
+
+        instance_matrix
+    }
+
     fn get_entities(
         device: &wgpu::Device,
     ) ->Vec<Entity>{
@@ -112,7 +129,6 @@ impl Skybox {
                                     pos: data.position[position_id],
                                     normal: data.normal[normal_id.unwrap()],
                                     texture: data.texture[texture_id.unwrap()],
-                                    
                                 })
                             }
                         }
@@ -197,6 +213,16 @@ impl framework::Example for Skybox {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -219,11 +245,18 @@ impl framework::Example for Skybox {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let local_matrix = glam::Mat4::default();
+        let local_matrix = glam::Mat4::from_translation(glam::vec3(0.0,0.0,-15.0));
         let init_local_matrix = local_matrix.to_cols_array();
         let uniform_local_matrix_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("local matrix Buffer"),
             contents: bytemuck::cast_slice(&init_local_matrix),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let instance_matrix = Self::get_instance();
+        let uniform_instance_matrix_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("instance matrix Buffer"),
+            contents: bytemuck::cast_slice(&instance_matrix),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -441,6 +474,10 @@ impl framework::Example for Skybox {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&matl_texture_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: uniform_instance_matrix_buf.as_entire_binding(),
+                },
             ],
             label: None,
         });
@@ -614,7 +651,7 @@ impl framework::Example for Skybox {
 
             for entity in self.entities.iter() {
                 rpass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                rpass.draw(0..entity.vertex_count, 0..1);
+                rpass.draw(0..entity.vertex_count, 0..((INSTANCE_SIZE*INSTANCE_SIZE) as u32));
             }
 
             rpass.set_pipeline(&self.sky_pipeline);

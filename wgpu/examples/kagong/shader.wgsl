@@ -21,6 +21,10 @@ var<uniform> r_data: Data;
 @binding(3)
 var<uniform> local_matrix: mat4x4<f32>;
 
+@group(0)
+@binding(5)
+var<uniform> instance_matrix: array<mat4x4<f32>,16>;
+
 @vertex
 fn vs_sky(@builtin(vertex_index) vertex_index: u32) -> SkyOutput {
     // hacky way to draw a large triangle
@@ -52,6 +56,7 @@ struct EntityOutput {
 
 @vertex
 fn vs_entity(
+    @builtin(instance_index) instance_index: u32,
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) texture: vec2<f32>,
@@ -59,7 +64,8 @@ fn vs_entity(
     var result: EntityOutput;
     result.normal = normal;
     result.view = pos - r_data.cam_pos.xyz;
-    result.position = r_data.proj * r_data.view * local_matrix * vec4<f32>(pos, 1.0);
+    result.position = r_data.proj * r_data.view * instance_matrix[instance_index] *local_matrix * vec4<f32>(pos, 1.0);
+
     result.texture = texture;
     return result;
 }
@@ -87,7 +93,7 @@ fn fs_entity(vertex: EntityOutput) -> @location(0) vec4<f32> {
     let rev_texture: vec2<f32> = vec2<f32>(
         vertex.texture[0],
         1.0-vertex.texture[1],
-        );
+    );
 
     // let reflected_color = textureSample(r_texture, r_sampler, reflected).rgb;
     // return vec4<f32>(vec3<f32>(0.1) + 0.5 * reflected_color, 1.0);
