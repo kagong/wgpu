@@ -50,7 +50,13 @@ impl Camera {
         raw
     }
 }
-
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+enum RotatationDir{
+    X,
+    Y,
+    Z,
+    None
+}
 pub struct Skybox {
     camera: Camera,
     sky_pipeline: wgpu::RenderPipeline,
@@ -67,6 +73,7 @@ pub struct Skybox {
     instance_size: u32,
     instance_matrix : Vec<f32>,
     storage_instance_matrix_buf : wgpu::Buffer,
+    rotatation_dir : RotatationDir,
 }
 
 impl Skybox {
@@ -162,6 +169,8 @@ impl framework::Example for Skybox {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Self {
+        let rotatation_dir = RotatationDir::None;
+
         let entities = Self::get_entities(device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -506,6 +515,7 @@ impl framework::Example for Skybox {
             instance_size,
             instance_matrix,
             storage_instance_matrix_buf,
+            rotatation_dir,
         }
     }
 
@@ -554,13 +564,31 @@ impl framework::Example for Skybox {
                             self.camera.pos -= glam::Vec3::X * 10.0;
                         },
                         Some(winit::event::VirtualKeyCode::Z) => { 
-                            self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
+                            if RotatationDir::X == self.rotatation_dir{
+                                self.rotatation_dir = RotatationDir::None;
+                            }
+                            else{
+                                self.rotatation_dir = RotatationDir::X;
+                            }
+                            //self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
                         },
                         Some(winit::event::VirtualKeyCode::X) => { 
-                            self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
+                            if RotatationDir::Y == self.rotatation_dir{
+                                self.rotatation_dir = RotatationDir::None;
+                            }
+                            else{
+                                self.rotatation_dir = RotatationDir::Y;
+                            }
+                            //self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
                         },
                         Some(winit::event::VirtualKeyCode::C) => { 
-                            self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
+                            if RotatationDir::Z == self.rotatation_dir{
+                                self.rotatation_dir = RotatationDir::None;
+                            }
+                            else{
+                                self.rotatation_dir = RotatationDir::Z;
+                            }
+                            //self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
                         },
 
                         Some(winit::event::VirtualKeyCode::O) => { 
@@ -610,6 +638,20 @@ impl framework::Example for Skybox {
         queue: &wgpu::Queue,
         _spawner: &framework::Spawner,
     ) {
+        match self.rotatation_dir {
+            RotatationDir::X => { 
+                self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
+            },
+            RotatationDir::Y => { 
+                self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
+            },
+            RotatationDir::Z => { 
+                self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
+            },
+            _ => {
+            },
+        }
+
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
