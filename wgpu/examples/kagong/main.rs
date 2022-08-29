@@ -2,11 +2,11 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use std::{borrow::Cow, f32::consts};
+use std::{borrow::Cow, f32::consts, cmp};
 use wgpu::{util::DeviceExt, AstcBlock, AstcChannel};
 
 const IMAGE_SIZE: u32 = 128;
-const INSTANCE_SIZE: usize = 4;
+const MAX_SKULL_COUNT: u32 = 256;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -64,6 +64,9 @@ pub struct Skybox {
     left_click : bool,
     dxdy : (f32, f32),
     local_matrix : glam::Mat4,
+    instance_size: u32,
+    instance_matrix : Vec<f32>,
+    storage_instance_matrix_buf : wgpu::Buffer,
 }
 
 impl Skybox {
@@ -90,25 +93,23 @@ impl Skybox {
         depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    fn get_instance() -> [f32;16*INSTANCE_SIZE*INSTANCE_SIZE]{
-        let mut instance_matrix = [0f32; 16*INSTANCE_SIZE * INSTANCE_SIZE ];
+    fn get_instance(
+        size : u32,
+    ) -> Vec<f32>{
+        let mut instance_matrix :Vec<f32> = Vec::new();
 
-        for i in 0..INSTANCE_SIZE{
-            for j in 0..INSTANCE_SIZE{
-                let start_index = i*INSTANCE_SIZE*16 + j*16;
-                let stride: f32 = 5.0;
+        for i in 0..size{
+            for j in 0..size{
+                let stride: f32 = 50.0;
                 let mat = glam::Mat4::from_translation(glam::vec3(stride*(i as f32),stride*(j as f32),0.0));
                 
-                instance_matrix[start_index..start_index+16].copy_from_slice(&AsRef::<[f32; 16]>::as_ref(&mat)[..]);
+                instance_matrix.extend(mat.to_cols_array().into_iter());
             }
         }
-
         instance_matrix
     }
 
-    fn get_entities(
-        device: &wgpu::Device,
-    ) ->Vec<Entity>{
+    fn get_entities(device: &wgpu::Device,) ->Vec<Entity>{
         let mut entities = Vec::new();
         let mut obj_load = obj::Obj::load("C:/MIDAS/wgpu/wgpu/examples/kagong/asset/Skull/12140_Skull_v3_L2.obj").unwrap();
         
@@ -161,7 +162,6 @@ impl framework::Example for Skybox {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Self {
-
         let entities = Self::get_entities(device);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -169,7 +169,7 @@ impl framework::Example for Skybox {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -217,7 +217,7 @@ impl framework::Example for Skybox {
                     binding: 5,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -253,11 +253,13 @@ impl framework::Example for Skybox {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let instance_matrix = Self::get_instance();
-        let uniform_instance_matrix_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_size = 1;
+        let instance_matrix = Self::get_instance(instance_size);
+        let storage_instance_matrix_buf = device.create_buffer(&wgt::BufferDescriptor{
             label: Some("instance matrix Buffer"),
-            contents: bytemuck::cast_slice(&instance_matrix),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: (16 * MAX_SKULL_COUNT * MAX_SKULL_COUNT) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -476,7 +478,7 @@ impl framework::Example for Skybox {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: uniform_instance_matrix_buf.as_entire_binding(),
+                    resource: storage_instance_matrix_buf.as_entire_binding(),
                 },
             ],
             label: None,
@@ -501,6 +503,9 @@ impl framework::Example for Skybox {
             left_click,
             dxdy,
             local_matrix,
+            instance_size,
+            instance_matrix,
+            storage_instance_matrix_buf,
         }
     }
 
@@ -537,16 +542,16 @@ impl framework::Example for Skybox {
                 if winit::event::ElementState::Pressed == input.state{ 
                     match input.virtual_keycode {
                         Some(winit::event::VirtualKeyCode::W) => { 
-                            self.camera.pos += glam::Vec3::Y * 0.1;
+                            self.camera.pos += glam::Vec3::Y * 10.0;
                         },
                         Some(winit::event::VirtualKeyCode::S) => { 
-                            self.camera.pos -= glam::Vec3::Y * 0.1;
+                            self.camera.pos -= glam::Vec3::Y * 10.0;
                         },
                         Some(winit::event::VirtualKeyCode::D) => { 
-                            self.camera.pos += glam::Vec3::X * 0.1;
+                            self.camera.pos += glam::Vec3::X * 10.0;
                         },
                         Some(winit::event::VirtualKeyCode::A) => { 
-                            self.camera.pos -= glam::Vec3::X * 0.1;
+                            self.camera.pos -= glam::Vec3::X * 10.0;
                         },
                         Some(winit::event::VirtualKeyCode::Z) => { 
                             self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
@@ -558,6 +563,19 @@ impl framework::Example for Skybox {
                             self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
                         },
 
+                        Some(winit::event::VirtualKeyCode::O) => { 
+                            self.instance_size -= 1;
+                            self.instance_size = cmp::max(self.instance_size, 1);
+                            self.instance_size = cmp::min(self.instance_size, MAX_SKULL_COUNT);
+                            self.instance_matrix = Self::get_instance(self.instance_size);
+                        },
+                        Some(winit::event::VirtualKeyCode::P) => { 
+                            self.instance_size += 1;
+                            self.instance_size = cmp::max(self.instance_size, 1);
+                            self.instance_size = cmp::min(self.instance_size, MAX_SKULL_COUNT);
+                            self.instance_matrix = Self::get_instance(self.instance_size);
+                        },
+
                         _ => {
                         },
                     }
@@ -567,7 +585,7 @@ impl framework::Example for Skybox {
 
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 if let winit::event::MouseScrollDelta::LineDelta(_, y ) = delta { 
-                    self.camera.pos += self.camera.dir * (y) * 1.0;
+                    self.camera.pos += self.camera.dir * (y) * 10.0;
                 }
                 
             }
@@ -618,6 +636,17 @@ impl framework::Example for Skybox {
             )
             .copy_from_slice(bytemuck::cast_slice(&raw_local));
 
+
+        self.staging_belt
+            .write_buffer(
+                &mut encoder,
+                &self.storage_instance_matrix_buf,
+                0,
+                wgpu::BufferSize::new((self.instance_matrix.len() * 4) as wgpu::BufferAddress).unwrap(),
+                device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&(self.instance_matrix)));
+
         self.staging_belt.finish();
 
         {
@@ -651,7 +680,7 @@ impl framework::Example for Skybox {
 
             for entity in self.entities.iter() {
                 rpass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                rpass.draw(0..entity.vertex_count, 0..((INSTANCE_SIZE*INSTANCE_SIZE) as u32));
+                rpass.draw(0..entity.vertex_count, 0..((self.instance_size*self.instance_size) as u32));
             }
 
             rpass.set_pipeline(&self.sky_pipeline);

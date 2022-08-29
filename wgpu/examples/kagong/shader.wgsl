@@ -23,7 +23,7 @@ var<uniform> local_matrix: mat4x4<f32>;
 
 @group(0)
 @binding(5)
-var<uniform> instance_matrix: array<mat4x4<f32>,16>;
+var<storage, read> instance_matrix: array<mat4x4<f32>>;
 
 @vertex
 fn vs_sky(@builtin(vertex_index) vertex_index: u32) -> SkyOutput {
