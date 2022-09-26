@@ -2,8 +2,8 @@
 mod framework;
 
 use bytemuck::{Pod, Zeroable};
-use std::{borrow::Cow, f32::consts, cmp};
-use wgpu::{util::DeviceExt, AstcBlock, AstcChannel};
+use std::{borrow::Cow, cmp, f32::consts};
+use wgpu::{util::DeviceExt, AstcBlock, AstcChannel, DownlevelCapabilities};
 
 const IMAGE_SIZE: u32 = 128;
 const MAX_SKULL_COUNT: u32 = 256;
@@ -21,24 +21,83 @@ struct Entity {
     vertex_buf: wgpu::Buffer,
 }
 
-// Note: we use the Y=up coordinate space in this example.
+struct Mirror {
+    range: (f32, f32),
+    pos: glam::Vec3,
+    normal_dir: glam::Vec3,
+    ref_dir: glam::Vec3,
+}
+impl Mirror {
+    fn get_vertex(&self, pos: glam::Vec3, texture: [f32; 2]) -> Vertex {
+        Vertex {
+            pos: pos.to_array(),
+            normal: self.normal_dir.to_array(),
+            texture: texture,
+        }
+    }
+    fn get_vertices(&self, device: &wgpu::Device) -> Vec<Vertex> {
+        let up_dir = self.normal_dir.cross(self.ref_dir);
+
+        let left_down = self.pos + self.ref_dir * self.range.0 - up_dir * self.range.1;
+        let left_up = self.pos + self.ref_dir * self.range.0 + up_dir * self.range.1;
+        let right_down = self.pos - self.ref_dir * self.range.0 - up_dir * self.range.1;
+        let right_up = self.pos - self.ref_dir * self.range.0 + up_dir * self.range.1;
+
+        let left_down_vertex = self.get_vertex(left_down, [0.0, 0.0]);
+        let left_up_vertex = self.get_vertex(left_up, [0.0, 1.0]);
+        let right_down_vertex = self.get_vertex(right_down, [1.0, 0.0]);
+        let right_up_vertex = self.get_vertex(right_up, [1.0, 1.0]);
+
+        //triangle list
+        let vertices = Vec::from([
+            left_down_vertex,
+            left_up_vertex,
+            right_up_vertex,
+            left_down_vertex,
+            right_up_vertex,
+            right_down_vertex,
+        ]);
+
+        vertices
+    }
+
+    fn get_buffer(&self, device: &wgpu::Device) -> Entity {
+        let vertices = self.get_vertices(device);
+        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Entity {
+            vertex_count: vertices.len() as u32,
+            vertex_buf,
+        }
+    }
+
+    fn update_buffer(&self, device: &wgpu::Device) {
+        /*
+        let vertices = self.get_vertices(device);
+        self.buffer.vertex_buf.slice(..).get_mapped_range_mut()[..vertices.len() as usize]
+        .copy_from_slice(vertices.in);
+        self.buffer.vertex_buf.unmap();
+
+        */
+    }
+}
+
 struct Camera {
     screen_size: (u32, u32),
     pos: glam::Vec3,
     dir: glam::Vec3,
-
 }
 
 impl Camera {
     fn to_uniform_data(&self) -> [f32; 16 * 3 + 4] {
         let aspect = self.screen_size.0 as f32 / self.screen_size.1 as f32;
         let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect, 1.0, 5000.0);
-        
-        let view = glam::Mat4::look_at_rh(
-            self.pos,
-            self.pos + self.dir,
-            glam::Vec3::Y,
-        );
+
+        let view = glam::Mat4::look_at_rh(self.pos, self.pos + self.dir, glam::Vec3::Y);
         let proj_inv = proj.inverse();
 
         let mut raw = [0f32; 16 * 3 + 4];
@@ -51,29 +110,33 @@ impl Camera {
     }
 }
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
-enum RotatationDir{
+enum RotatationDir {
     X,
     Y,
     Z,
-    None
+    None,
 }
 pub struct Skybox {
     camera: Camera,
     sky_pipeline: wgpu::RenderPipeline,
     entity_pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
-    uniform_buf: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    entity_bind_group: wgpu::BindGroup,
+    skybox_bind_group: wgpu::BindGroup,
+    camera_uniform_buf: wgpu::Buffer,
     uniform_local_matrix_buf: wgpu::Buffer,
     entities: Vec<Entity>,
     depth_view: wgpu::TextureView,
     staging_belt: wgpu::util::StagingBelt,
-    left_click : bool,
-    dxdy : (f32, f32),
-    local_matrix : glam::Mat4,
+    left_click: bool,
+    dxdy: (f32, f32),
+    local_matrix: glam::Mat4,
     instance_size: u32,
-    instance_matrix : Vec<f32>,
-    storage_instance_matrix_buf : wgpu::Buffer,
-    rotatation_dir : RotatationDir,
+    instance_matrix: Vec<f32>,
+    storage_instance_matrix_buf: wgpu::Buffer,
+    rotatation_dir: RotatationDir,
+    mirror: Mirror,
+    mirror_entity: Entity,
 }
 
 impl Skybox {
@@ -100,58 +163,61 @@ impl Skybox {
         depth_texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    fn get_instance(
-        size : u32,
-    ) -> Vec<f32>{
-        let mut instance_matrix :Vec<f32> = Vec::new();
+    fn get_instance(size: u32) -> Vec<f32> {
+        let mut instance_matrix: Vec<f32> = Vec::new();
 
-        for i in 0..size{
-            for j in 0..size{
+        for i in 0..size {
+            for j in 0..size {
                 let stride: f32 = 50.0;
-                let mat = glam::Mat4::from_translation(glam::vec3(stride*(i as f32),stride*(j as f32),0.0));
-                
+                let mat = glam::Mat4::from_translation(glam::vec3(
+                    stride * (i as f32),
+                    stride * (j as f32),
+                    0.0,
+                ));
+
                 instance_matrix.extend(mat.to_cols_array().into_iter());
             }
         }
         instance_matrix
     }
 
-    fn get_entities(device: &wgpu::Device,) ->Vec<Entity>{
+    fn get_entities(device: &wgpu::Device) -> Vec<Entity> {
         let mut entities = Vec::new();
-        let mut obj_load = obj::Obj::load("C:/MIDAS/wgpu/wgpu/examples/kagong/asset/Skull/12140_Skull_v3_L2.obj").unwrap();
-        
-            let _ = obj_load.load_mtls();
-            
-            let data = obj_load.data;
-            
-            let mut vertices = Vec::new();
-            for object in data.objects {
-                for group in object.groups {
-                    vertices.clear();
-                    for poly in group.polys {
-                        for end_index in 2..poly.0.len() {
-                            for &index in &[0, end_index - 1, end_index] {
-                                let obj::IndexTuple(position_id, texture_id, normal_id) =
-                                    poly.0[index];
-                                vertices.push(Vertex {
-                                    pos: data.position[position_id],
-                                    normal: data.normal[normal_id.unwrap()],
-                                    texture: data.texture[texture_id.unwrap()],
-                                })
-                            }
+        let mut obj_load =
+            obj::Obj::load("C:/MIDAS/wgpu/wgpu/examples/kagong/asset/Skull/12140_Skull_v3_L2.obj")
+                .unwrap();
+
+        let _ = obj_load.load_mtls();
+
+        let data = obj_load.data;
+
+        let mut vertices = Vec::new();
+        for object in data.objects {
+            for group in object.groups {
+                vertices.clear();
+                for poly in group.polys {
+                    for end_index in 2..poly.0.len() {
+                        for &index in &[0, end_index - 1, end_index] {
+                            let obj::IndexTuple(position_id, texture_id, normal_id) = poly.0[index];
+                            vertices.push(Vertex {
+                                pos: data.position[position_id],
+                                normal: data.normal[normal_id.unwrap()],
+                                texture: data.texture[texture_id.unwrap()],
+                            })
                         }
                     }
-                    let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Vertex"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    entities.push(Entity {
-                        vertex_count: vertices.len() as u32,
-                        vertex_buf,
-                    });
                 }
+                let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                entities.push(Entity {
+                    vertex_count: vertices.len() as u32,
+                    vertex_buf,
+                });
             }
+        }
         entities
     }
 }
@@ -162,7 +228,7 @@ impl framework::Example for Skybox {
             | wgpu::Features::TEXTURE_COMPRESSION_ETC2
             | wgpu::Features::TEXTURE_COMPRESSION_BC
     }
-    
+
     fn init(
         config: &wgpu::SurfaceConfiguration,
         _adapter: &wgpu::Adapter,
@@ -173,10 +239,10 @@ impl framework::Example for Skybox {
 
         let entities = Self::get_entities(device);
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        let camera_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
@@ -185,313 +251,374 @@ impl framework::Example for Skybox {
                         min_binding_size: None,
                     },
                     count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::Cube,
+                }],
+            });
+        let entity_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        //local_matrix
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        // instance_matrix
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    wgpu::BindGroupLayoutEntry {
+                        //sampler
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        //custom_texture
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
+        let skybox_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        //r_texture
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::Cube,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        //r_texture
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         // Create the render pipeline
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
-        });
 
         let camera = Camera {
             screen_size: (config.width, config.height),
-            pos : glam::vec3(0.0, 0.0, 0.0),
-            dir : glam::vec3(0.0, 0.0, 1.0)
+            pos: glam::vec3(0.0, 0.0, 0.0),
+            dir: glam::vec3(0.0, 0.0, 1.0),
         };
 
-        let cam_uniforms = camera.to_uniform_data();
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let camera_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Buffer"),
-            contents: bytemuck::cast_slice(&cam_uniforms),
+            contents: bytemuck::cast_slice(&camera.to_uniform_data()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let local_matrix = glam::Mat4::from_translation(glam::vec3(0.0,0.0,-15.0));
-        let init_local_matrix = local_matrix.to_cols_array();
-        let uniform_local_matrix_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("local matrix Buffer"),
-            contents: bytemuck::cast_slice(&init_local_matrix),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let local_matrix = glam::Mat4::from_translation(glam::vec3(0.0, 0.0, -15.0));
+        let uniform_local_matrix_buf = {
+            let init_local_matrix = local_matrix.to_cols_array();
 
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("local matrix Buffer"),
+                contents: bytemuck::cast_slice(&init_local_matrix),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        
         let instance_size = 1;
-        let instance_matrix = Self::get_instance(instance_size);
-        let storage_instance_matrix_buf = device.create_buffer(&wgt::BufferDescriptor{
+        let instance_matrix = {
+            Self::get_instance(instance_size)
+        };
+
+        let storage_instance_matrix_buf = device.create_buffer(&wgt::BufferDescriptor {
             label: Some("instance matrix Buffer"),
             size: (16 * MAX_SKULL_COUNT * MAX_SKULL_COUNT) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
         // Create the render pipelines
-        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Sky"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_sky",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_sky",
-                targets: &[Some(config.format.into())],
-            }),
-            primitive: wgpu::PrimitiveState {
-                front_face: wgpu::FrontFace::Cw,
+        let sky_pipeline = {
+            let skybox_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("skybox.wgsl"))),
+            });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&camera_group_layout, &skybox_group_layout],
+                push_constant_ranges: &[],
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Sky"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &skybox_shader,
+                    entry_point: "vs_sky",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &skybox_shader,
+                    entry_point: "fs_sky",
+                    targets: &[Some(config.format.into())],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Cw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Self::DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+        let entity_pipeline = {
+            let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("entity.wgsl"))),
+            });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&camera_group_layout, &entity_group_layout],
+                push_constant_ranges: &[],
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Entity"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &entity_shader,
+                    entry_point: "vs_entity",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &entity_shader,
+                    entry_point: "fs_entity",
+                    targets: &[Some(config.format.into())],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Cw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Self::DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+
+        let (camera_bind_group, entity_bind_group, skybox_bind_group) = {
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: None,
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: Self::DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
-        let entity_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Entity"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_entity",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_entity",
-                targets: &[Some(config.format.into())],
-            }),
-            primitive: wgpu::PrimitiveState {
-                front_face: wgpu::FrontFace::Cw,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: Self::DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+            });
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: None,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        
-        let skybox_texture_view = {
-            let device_features = device.features();
-
-            let skybox_format =
-                if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
-                    log::info!("Using ASTC_LDR");
+            let skybox_texture_view = {
+                let device_features = device.features();
+    
+                let skybox_format =
+                    if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC_LDR) {
+                        log::info!("Using ASTC_LDR");
+                        wgpu::TextureFormat::Astc {
+                            block: AstcBlock::B4x4,
+                            channel: AstcChannel::UnormSrgb,
+                        }
+                    } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+                        log::info!("Using ETC2");
+                        wgpu::TextureFormat::Etc2Rgb8UnormSrgb
+                    } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+                        log::info!("Using BC");
+                        wgpu::TextureFormat::Bc1RgbaUnormSrgb
+                    } else {
+                        log::info!("Using plain");
+                        wgpu::TextureFormat::Bgra8UnormSrgb
+                    };
+    
+                let size = wgpu::Extent3d {
+                    width: IMAGE_SIZE,
+                    height: IMAGE_SIZE,
+                    depth_or_array_layers: 6,
+                };
+    
+                let layer_size = wgpu::Extent3d {
+                    depth_or_array_layers: 1,
+                    ..size
+                };
+                let max_mips = layer_size.max_mips(wgpu::TextureDimension::D2);
+    
+                log::debug!(
+                    "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
+                    skybox_format,
+                    IMAGE_SIZE,
+                    IMAGE_SIZE,
+                    max_mips,
+                );
+    
+                let bytes = match skybox_format {
                     wgpu::TextureFormat::Astc {
                         block: AstcBlock::B4x4,
                         channel: AstcChannel::UnormSrgb,
-                    }
-                } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
-                    log::info!("Using ETC2");
-                    wgpu::TextureFormat::Etc2Rgb8UnormSrgb
-                } else if device_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
-                    log::info!("Using BC");
-                    wgpu::TextureFormat::Bc1RgbaUnormSrgb
-                } else {
-                    log::info!("Using plain");
-                    wgpu::TextureFormat::Bgra8UnormSrgb
+                    } => &include_bytes!("images/astc.dds")[..],
+                    wgpu::TextureFormat::Etc2Rgb8UnormSrgb => &include_bytes!("images/etc2.dds")[..],
+                    wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
+                    wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
+                    _ => unreachable!(),
                 };
-
-            let size = wgpu::Extent3d {
-                width: IMAGE_SIZE,
-                height: IMAGE_SIZE,
-                depth_or_array_layers: 6,
+    
+                let image = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+    
+                let texture = device.create_texture_with_data(
+                    queue,
+                    &wgpu::TextureDescriptor {
+                        size,
+                        mip_level_count: max_mips as u32,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: skybox_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        label: None,
+                    },
+                    &image.data,
+                );
+    
+                let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: None,
+                    dimension: Some(wgpu::TextureViewDimension::Cube),
+                    ..wgpu::TextureViewDescriptor::default()
+                });
+                texture_view
             };
-
-            let layer_size = wgpu::Extent3d {
-                depth_or_array_layers: 1,
-                ..size
-            };
-            let max_mips = layer_size.max_mips(wgpu::TextureDimension::D2);
-
-            log::debug!(
-                "Copying {:?} skybox images of size {}, {}, 6 with {} mips to gpu",
-                skybox_format,
-                IMAGE_SIZE,
-                IMAGE_SIZE,
-                max_mips,
-            );
-
-            let bytes = match skybox_format {
-                wgpu::TextureFormat::Astc {
-                    block: AstcBlock::B4x4,
-                    channel: AstcChannel::UnormSrgb,
-                } => &include_bytes!("images/astc.dds")[..],
-                wgpu::TextureFormat::Etc2Rgb8UnormSrgb => &include_bytes!("images/etc2.dds")[..],
-                wgpu::TextureFormat::Bc1RgbaUnormSrgb => &include_bytes!("images/bc1.dds")[..],
-                wgpu::TextureFormat::Bgra8UnormSrgb => &include_bytes!("images/bgra.dds")[..],
-                _ => unreachable!(),
-            };
-
-            let image = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).unwrap();
-
-            let texture = device.create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
+    
+            let matl_texture_view = {
+                let img_data = include_bytes!("asset/Skull/Skull.png");
+                let decoder = png::Decoder::new(std::io::Cursor::new(img_data));
+                let mut reader = decoder.read_info().unwrap();
+                let mut buf = vec![0; reader.output_buffer_size()];
+                let info = reader.next_frame(&mut buf).unwrap();
+    
+                let size = wgpu::Extent3d {
+                    width: info.width,
+                    height: info.height,
+                    depth_or_array_layers: 1,
+                };
+    
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
                     size,
-                    mip_level_count: max_mips as u32,
+                    mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: skybox_format,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    label: None,
-                },
-                &image.data,
-            );
-
-            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                label: None,
-                dimension: Some(wgpu::TextureViewDimension::Cube),
-                ..wgpu::TextureViewDescriptor::default()
-            });
-            texture_view
-        };
-
-        let matl_texture_view = {
-            let img_data = include_bytes!("asset/Skull/Skull.png");
-            let decoder = png::Decoder::new(std::io::Cursor::new(img_data));
-            let mut reader = decoder.read_info().unwrap();
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let info = reader.next_frame(&mut buf).unwrap();
-
-            let size = wgpu::Extent3d {
-                width: info.width,
-                height: info.height,
-                depth_or_array_layers: 1,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                });
+    
+                queue.write_texture(
+                    texture.as_image_copy(),
+                    &buf,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: std::num::NonZeroU32::new(info.width * 4),
+                        rows_per_image: None,
+                    },
+                    size,
+                );
+    
+                texture.create_view(&wgpu::TextureViewDescriptor::default())
             };
 
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            });
-
-            queue.write_texture(
-                texture.as_image_copy(),
-                &buf,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: std::num::NonZeroU32::new(info.width * 4),
-                    rows_per_image: None,
-                },
-                size,
-            );
-
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
+            (
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &camera_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_uniform_buf.as_entire_binding(),
+                    }],
+                    label: None,
+                }),
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &entity_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_local_matrix_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: storage_instance_matrix_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&matl_texture_view),
+                        },
+                    ],
+                    label: None,
+                }),
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &skybox_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&skybox_texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                    label: None,
+                }),
+            )
         };
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&skybox_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: uniform_local_matrix_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&matl_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: storage_instance_matrix_buf.as_entire_binding(),
-                },
-            ],
-            label: None,
-        });
 
         let depth_view = Self::create_depth_texture(config, device);
 
@@ -499,12 +626,22 @@ impl framework::Example for Skybox {
 
         let dxdy = (0.0, 0.0);
 
+        let mirror = Mirror {
+            range: (10.0, 10.0),
+            pos: glam::vec3(0.0, 0.0, 0.0),
+            normal_dir: glam::vec3(0.0, 0.0, -1.0),
+            ref_dir: glam::vec3(0.0, 1.0, 0.0),
+        };
+        let mirror_entity = mirror.get_buffer(device);
+
         Skybox {
             camera,
             sky_pipeline,
             entity_pipeline,
-            bind_group,
-            uniform_buf,
+            camera_bind_group,
+            entity_bind_group,
+            skybox_bind_group,
+            camera_uniform_buf,
             uniform_local_matrix_buf,
             entities,
             depth_view,
@@ -516,6 +653,8 @@ impl framework::Example for Skybox {
             instance_matrix,
             storage_instance_matrix_buf,
             rotatation_dir,
+            mirror,
+            mirror_entity,
         }
     }
 
@@ -523,10 +662,10 @@ impl framework::Example for Skybox {
     fn update(&mut self, event: winit::event::WindowEvent) {
         match event {
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
-                if winit::event::MouseButton::Left == button{ 
-                    if winit::event::ElementState::Pressed == state{
+                if winit::event::MouseButton::Left == button {
+                    if winit::event::ElementState::Pressed == state {
                         self.left_click = true;
-                    } else{
+                    } else {
                         self.left_click = false;
                     }
                 }
@@ -538,84 +677,77 @@ impl framework::Example for Skybox {
 
                 let d_x = norm_x - self.dxdy.0;
                 let d_y = norm_y - self.dxdy.1;
-                    
+
                 self.dxdy.0 = norm_x;
                 self.dxdy.1 = norm_y;
-                if self.left_click == true{
-                        
+                if self.left_click == true {
                     let rot = glam::Mat3::from_rotation_y(d_x) * glam::Mat3::from_rotation_x(d_y);
                     self.camera.dir = rot * self.camera.dir;
                 }
             }
 
             winit::event::WindowEvent::KeyboardInput { input, .. } => {
-                if winit::event::ElementState::Pressed == input.state{ 
+                if winit::event::ElementState::Pressed == input.state {
                     match input.virtual_keycode {
-                        Some(winit::event::VirtualKeyCode::W) => { 
+                        Some(winit::event::VirtualKeyCode::W) => {
                             self.camera.pos += glam::Vec3::Y * 10.0;
-                        },
-                        Some(winit::event::VirtualKeyCode::S) => { 
+                        }
+                        Some(winit::event::VirtualKeyCode::S) => {
                             self.camera.pos -= glam::Vec3::Y * 10.0;
-                        },
-                        Some(winit::event::VirtualKeyCode::D) => { 
+                        }
+                        Some(winit::event::VirtualKeyCode::D) => {
                             self.camera.pos += glam::Vec3::X * 10.0;
-                        },
-                        Some(winit::event::VirtualKeyCode::A) => { 
+                        }
+                        Some(winit::event::VirtualKeyCode::A) => {
                             self.camera.pos -= glam::Vec3::X * 10.0;
-                        },
-                        Some(winit::event::VirtualKeyCode::Z) => { 
-                            if RotatationDir::X == self.rotatation_dir{
+                        }
+                        Some(winit::event::VirtualKeyCode::Z) => {
+                            if RotatationDir::X == self.rotatation_dir {
                                 self.rotatation_dir = RotatationDir::None;
-                            }
-                            else{
+                            } else {
                                 self.rotatation_dir = RotatationDir::X;
                             }
                             //self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
-                        },
-                        Some(winit::event::VirtualKeyCode::X) => { 
-                            if RotatationDir::Y == self.rotatation_dir{
+                        }
+                        Some(winit::event::VirtualKeyCode::X) => {
+                            if RotatationDir::Y == self.rotatation_dir {
                                 self.rotatation_dir = RotatationDir::None;
-                            }
-                            else{
+                            } else {
                                 self.rotatation_dir = RotatationDir::Y;
                             }
                             //self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
-                        },
-                        Some(winit::event::VirtualKeyCode::C) => { 
-                            if RotatationDir::Z == self.rotatation_dir{
+                        }
+                        Some(winit::event::VirtualKeyCode::C) => {
+                            if RotatationDir::Z == self.rotatation_dir {
                                 self.rotatation_dir = RotatationDir::None;
-                            }
-                            else{
+                            } else {
                                 self.rotatation_dir = RotatationDir::Z;
                             }
                             //self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
-                        },
+                        }
 
-                        Some(winit::event::VirtualKeyCode::O) => { 
+                        Some(winit::event::VirtualKeyCode::O) => {
                             self.instance_size -= 1;
                             self.instance_size = cmp::max(self.instance_size, 1);
                             self.instance_size = cmp::min(self.instance_size, MAX_SKULL_COUNT);
                             self.instance_matrix = Self::get_instance(self.instance_size);
-                        },
-                        Some(winit::event::VirtualKeyCode::P) => { 
+                        }
+                        Some(winit::event::VirtualKeyCode::P) => {
                             self.instance_size += 1;
                             self.instance_size = cmp::max(self.instance_size, 1);
                             self.instance_size = cmp::min(self.instance_size, MAX_SKULL_COUNT);
                             self.instance_matrix = Self::get_instance(self.instance_size);
-                        },
+                        }
 
-                        _ => {
-                        },
+                        _ => {}
                     }
-
                 }
             }
 
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
-                if let winit::event::MouseScrollDelta::LineDelta(_, y ) = delta { 
+                if let winit::event::MouseScrollDelta::LineDelta(_, y) = delta {
                     self.camera.pos += self.camera.dir * (y) * 10.0;
                 }
-                
             }
             _ => {}
         }
@@ -639,17 +771,16 @@ impl framework::Example for Skybox {
         _spawner: &framework::Spawner,
     ) {
         match self.rotatation_dir {
-            RotatationDir::X => { 
+            RotatationDir::X => {
                 self.local_matrix = glam::Mat4::from_rotation_x(1.0) * self.local_matrix;
-            },
-            RotatationDir::Y => { 
+            }
+            RotatationDir::Y => {
                 self.local_matrix = glam::Mat4::from_rotation_y(1.0) * self.local_matrix;
-            },
-            RotatationDir::Z => { 
+            }
+            RotatationDir::Z => {
                 self.local_matrix = glam::Mat4::from_rotation_z(1.0) * self.local_matrix;
-            },
-            _ => {
-            },
+            }
+            _ => {}
         }
 
         let mut encoder =
@@ -660,7 +791,7 @@ impl framework::Example for Skybox {
         self.staging_belt
             .write_buffer(
                 &mut encoder,
-                &self.uniform_buf,
+                &self.camera_uniform_buf,
                 0,
                 wgpu::BufferSize::new((raw_uniforms.len() * 4) as wgpu::BufferAddress).unwrap(),
                 device,
@@ -678,13 +809,13 @@ impl framework::Example for Skybox {
             )
             .copy_from_slice(bytemuck::cast_slice(&raw_local));
 
-
         self.staging_belt
             .write_buffer(
                 &mut encoder,
                 &self.storage_instance_matrix_buf,
                 0,
-                wgpu::BufferSize::new((self.instance_matrix.len() * 4) as wgpu::BufferAddress).unwrap(),
+                wgpu::BufferSize::new((self.instance_matrix.len() * 4) as wgpu::BufferAddress)
+                    .unwrap(),
                 device,
             )
             .copy_from_slice(bytemuck::cast_slice(&(self.instance_matrix)));
@@ -717,14 +848,23 @@ impl framework::Example for Skybox {
                 }),
             });
 
-            rpass.set_bind_group(0, &self.bind_group, &[]);
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            rpass.set_bind_group(1, &self.entity_bind_group, &[]);
             rpass.set_pipeline(&self.entity_pipeline);
 
             for entity in self.entities.iter() {
                 rpass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                rpass.draw(0..entity.vertex_count, 0..((self.instance_size*self.instance_size) as u32));
+                rpass.draw(
+                    0..entity.vertex_count,
+                    0..((self.instance_size * self.instance_size) as u32),
+                );
             }
 
+            //rpass.set_vertex_buffer(0, self.mirror_entity.vertex_buf.slice(..));
+            //rpass.draw(0..self.mirror_entity.vertex_count, 0..1);
+
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            rpass.set_bind_group(1, &self.skybox_bind_group, &[]);
             rpass.set_pipeline(&self.sky_pipeline);
             rpass.draw(0..3, 0..1);
         }
