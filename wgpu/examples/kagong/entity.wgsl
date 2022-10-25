@@ -61,7 +61,5 @@ fn fs_entity(vertex: EntityOutput) -> @location(0) vec4<f32> {
         1.0-vertex.texture[1],
     );
 
-    // let reflected_color = textureSample(r_texture, r_sampler, reflected).rgb;
-    // return vec4<f32>(vec3<f32>(0.1) + 0.5 * reflected_color, 1.0);
     return textureSample(custom_texture, r_sampler,rev_texture);
 }

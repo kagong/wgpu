@@ -3,7 +3,7 @@ mod framework;
 
 use bytemuck::{Pod, Zeroable};
 use std::{borrow::Cow, cmp, f32::consts};
-use wgpu::{util::DeviceExt, AstcBlock, AstcChannel, DownlevelCapabilities};
+use wgpu::{util::DeviceExt, AstcBlock, AstcChannel};
 
 const IMAGE_SIZE: u32 = 128;
 const MAX_SKULL_COUNT: u32 = 256;
@@ -43,10 +43,10 @@ impl Mirror {
         let right_down = self.pos - self.ref_dir * self.range.0 - up_dir * self.range.1;
         let right_up = self.pos - self.ref_dir * self.range.0 + up_dir * self.range.1;
 
-        let left_down_vertex = self.get_vertex(left_down, [0.0, 0.0]);
-        let left_up_vertex = self.get_vertex(left_up, [0.0, 1.0]);
-        let right_down_vertex = self.get_vertex(right_down, [1.0, 0.0]);
-        let right_up_vertex = self.get_vertex(right_up, [1.0, 1.0]);
+        let left_down_vertex = self.get_vertex(left_down, [0.0, 1.0]);
+        let left_up_vertex = self.get_vertex(left_up, [1.0, 1.0]);
+        let right_up_vertex = self.get_vertex(right_up, [1.0, 0.0]);
+        let right_down_vertex = self.get_vertex(right_down, [0.0, 0.0]);
 
         //triangle list
         let vertices = Vec::from([
@@ -84,20 +84,43 @@ impl Mirror {
 
         */
     }
+
+    fn create_mirror_texture(
+        screen: [u32; 2],
+        device: &wgpu::Device,
+    ) -> wgpu::TextureView {
+        let mirror_texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width: screen[0],
+                height: screen[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            label: None,
+        });
+
+        mirror_texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
 }
 
 struct Camera {
+    fovy : f32,
     screen_size: (u32, u32),
     pos: glam::Vec3,
     dir: glam::Vec3,
+    up: glam::Vec3,
 }
 
 impl Camera {
     fn to_uniform_data(&self) -> [f32; 16 * 3 + 4] {
         let aspect = self.screen_size.0 as f32 / self.screen_size.1 as f32;
-        let proj = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect, 1.0, 5000.0);
+        let proj = glam::Mat4::perspective_rh(self.fovy, aspect, 1.0, 5000.0);
 
-        let view = glam::Mat4::look_at_rh(self.pos, self.pos + self.dir, glam::Vec3::Y);
+        let view = glam::Mat4::look_at_rh(self.pos, self.pos + self.dir, self.up);
         let proj_inv = proj.inverse();
 
         let mut raw = [0f32; 16 * 3 + 4];
@@ -123,6 +146,7 @@ pub struct Skybox {
     camera_bind_group: wgpu::BindGroup,
     entity_bind_group: wgpu::BindGroup,
     skybox_bind_group: wgpu::BindGroup,
+    mirror_bind_group: wgpu::BindGroup,
     camera_uniform_buf: wgpu::Buffer,
     uniform_local_matrix_buf: wgpu::Buffer,
     entities: Vec<Entity>,
@@ -137,19 +161,21 @@ pub struct Skybox {
     rotatation_dir: RotatationDir,
     mirror: Mirror,
     mirror_entity: Entity,
+    mirror_view: wgpu::TextureView,
+    mirror_depth_view: wgpu::TextureView,
 }
 
 impl Skybox {
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 
     fn create_depth_texture(
-        config: &wgpu::SurfaceConfiguration,
+        screen: [u32;2],
         device: &wgpu::Device,
     ) -> wgpu::TextureView {
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
+                width: screen[0],
+                height: screen[1],
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -324,12 +350,13 @@ impl framework::Example for Skybox {
                 ],
             });
 
-        // Create the render pipeline
 
         let camera = Camera {
+            fovy: consts::FRAC_PI_4,
             screen_size: (config.width, config.height),
             pos: glam::vec3(0.0, 0.0, 0.0),
             dir: glam::vec3(0.0, 0.0, 1.0),
+            up:  glam::Vec3::Y,
         };
 
         let camera_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -447,7 +474,25 @@ impl framework::Example for Skybox {
             })
         };
 
-        let (camera_bind_group, entity_bind_group, skybox_bind_group) = {
+        let depth_view = Self::create_depth_texture([config.width, config.height], device);
+
+        let left_click = false;
+
+        let dxdy = (0.0, 0.0);
+
+        let mirror = Mirror {
+            range: (200.0, 200.0),
+            pos: glam::vec3(0.0, 0.0, 100.0),
+            normal_dir: glam::vec3(0.0, 0.0, -1.0),
+            ref_dir: glam::vec3(0.0, 1.0, 0.0),
+        };
+        let mirror_entity = mirror.get_buffer(device);
+
+        let mirror_view = Mirror::create_mirror_texture([(mirror.range.0 * 2.0 )as u32, (mirror.range.1 * 2.0 ) as u32], device);
+
+        let mirror_depth_view = Self::create_depth_texture([(mirror.range.0 * 2.0 )as u32, (mirror.range.1 * 2.0 ) as u32], device);
+
+        let (camera_bind_group, entity_bind_group, skybox_bind_group, mirror_bind_group) = {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: None,
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -617,22 +662,30 @@ impl framework::Example for Skybox {
                     ],
                     label: None,
                 }),
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &entity_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_local_matrix_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: storage_instance_matrix_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&mirror_view),
+                        },
+                    ],
+                    label: None,
+                }),
             )
         };
-
-        let depth_view = Self::create_depth_texture(config, device);
-
-        let left_click = false;
-
-        let dxdy = (0.0, 0.0);
-
-        let mirror = Mirror {
-            range: (10.0, 10.0),
-            pos: glam::vec3(0.0, 0.0, 0.0),
-            normal_dir: glam::vec3(0.0, 0.0, -1.0),
-            ref_dir: glam::vec3(0.0, 1.0, 0.0),
-        };
-        let mirror_entity = mirror.get_buffer(device);
 
         Skybox {
             camera,
@@ -641,6 +694,7 @@ impl framework::Example for Skybox {
             camera_bind_group,
             entity_bind_group,
             skybox_bind_group,
+            mirror_bind_group,
             camera_uniform_buf,
             uniform_local_matrix_buf,
             entities,
@@ -655,6 +709,8 @@ impl framework::Example for Skybox {
             rotatation_dir,
             mirror,
             mirror_entity,
+            mirror_view,
+            mirror_depth_view,
         }
     }
 
@@ -759,7 +815,7 @@ impl framework::Example for Skybox {
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
     ) {
-        self.depth_view = Self::create_depth_texture(config, device);
+        self.depth_view = Self::create_depth_texture([config.width, config.height], device);
         self.camera.screen_size = (config.width, config.height);
     }
 
@@ -786,8 +842,22 @@ impl framework::Example for Skybox {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+            
+        let mirror_cam = {
+            let view_dir = (self.mirror.pos - self.camera.pos).normalize();
+            let reflection_dir = 2.0 * self.mirror.normal_dir.dot(-view_dir) * self.mirror.normal_dir + view_dir;
+            
+            Camera {
+                fovy: consts::FRAC_PI_2,
+                screen_size: (self.mirror.range.0 as u32, self.mirror.range.1 as u32),
+                pos: self.mirror.pos,
+                dir: reflection_dir,
+                up:  glam::Vec3::Y,
+            }
+        };
+            
         // update rotation
-        let raw_uniforms = self.camera.to_uniform_data();
+        let raw_uniforms = mirror_cam.to_uniform_data();
         self.staging_belt
             .write_buffer(
                 &mut encoder,
@@ -823,8 +893,65 @@ impl framework::Example for Skybox {
         self.staging_belt.finish();
 
         {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut mirror_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mirror_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.mirror_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: false,
+                    }),
+                    stencil_ops: None,
+                }),
+            });
+
+            mirror_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            mirror_pass.set_bind_group(1, &self.entity_bind_group, &[]);
+            mirror_pass.set_pipeline(&self.entity_pipeline);
+
+            for entity in self.entities.iter() {
+                mirror_pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
+                mirror_pass.draw(
+                    0..entity.vertex_count,
+                    0..((self.instance_size * self.instance_size) as u32),
+                );
+            }
+
+            mirror_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            mirror_pass.set_bind_group(1, &self.skybox_bind_group, &[]);
+            mirror_pass.set_pipeline(&self.sky_pipeline);
+            mirror_pass.draw(0..3, 0..1);
+            
+        }
+        let raw_uniforms = self.camera.to_uniform_data();
+        self.staging_belt
+            .write_buffer(
+                &mut encoder,
+                &self.camera_uniform_buf,
+                0,
+                wgpu::BufferSize::new((raw_uniforms.len() * 4) as wgpu::BufferAddress).unwrap(),
+                device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&raw_uniforms));
+
+        self.staging_belt.finish();
+
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("First"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
@@ -842,33 +969,71 @@ impl framework::Example for Skybox {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: false,
+                        store: true,
                     }),
                     stencil_ops: None,
                 }),
             });
 
-            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
-            rpass.set_bind_group(1, &self.entity_bind_group, &[]);
-            rpass.set_pipeline(&self.entity_pipeline);
+            {
+                rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                rpass.set_bind_group(1, &self.entity_bind_group, &[]);
+                rpass.set_pipeline(&self.entity_pipeline);
 
-            for entity in self.entities.iter() {
-                rpass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                rpass.draw(
-                    0..entity.vertex_count,
-                    0..((self.instance_size * self.instance_size) as u32),
-                );
+                for entity in self.entities.iter() {
+                    rpass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
+                    rpass.draw(
+                        0..entity.vertex_count,
+                        0..((self.instance_size * self.instance_size) as u32),
+                    );
+                }
+
+                rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                rpass.set_bind_group(1, &self.skybox_bind_group, &[]);
+                rpass.set_pipeline(&self.sky_pipeline);
+                rpass.draw(0..3, 0..1);
             }
-
-            //rpass.set_vertex_buffer(0, self.mirror_entity.vertex_buf.slice(..));
-            //rpass.draw(0..self.mirror_entity.vertex_count, 0..1);
-
-            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
-            rpass.set_bind_group(1, &self.skybox_bind_group, &[]);
-            rpass.set_pipeline(&self.sky_pipeline);
-            rpass.draw(0..3, 0..1);
         }
 
+        let raw_local = glam::Mat4::default().to_cols_array();
+        self.staging_belt
+            .write_buffer(
+                &mut encoder,
+                &self.uniform_local_matrix_buf,
+                0,
+                wgpu::BufferSize::new((raw_local.len() * 4) as wgpu::BufferAddress).unwrap(),
+                device,
+            )
+            .copy_from_slice(bytemuck::cast_slice(&raw_local));
+        self.staging_belt.finish();
+
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Second"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: true,
+                    }),
+                    stencil_ops: None,
+                }),
+            });
+            rpass.set_pipeline(&self.entity_pipeline);
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            rpass.set_bind_group(1, &self.mirror_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.mirror_entity.vertex_buf.slice(..));
+            rpass.draw(0..self.mirror_entity.vertex_count, 0..1);
+        }
+        
         queue.submit(std::iter::once(encoder.finish()));
 
         self.staging_belt.recall();
